@@ -29,6 +29,7 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/endian/arithmetic.hpp>
 #include <openssl/err.h>
+#include <opus/opus.h>
 
 extern "C" {
   // clang-format off
@@ -104,6 +105,7 @@ extern "C" {
 #define IDX_SET_CLIPBOARD 16
 #define IDX_FILE_TRANSFER_NONCE_REQUEST 17
 #define IDX_SET_ADAPTIVE_TRIGGERS 18
+#define IDX_MIC_AUDIO_DATA 19
 
 static const short packetTypes[] = {
   0x0305,  // Start A
@@ -125,6 +127,7 @@ static const short packetTypes[] = {
   0x3001,  // Set Clipboard (Apollo protocol extension)
   0x3002,  // File transfer nonce request (Apollo protocol extension)
   0x5503,  // Set Adaptive triggers (Sunshine protocol extension)
+  0x3003,  // Mic audio data (Apollo protocol extension)
 };
 
 namespace asio = boost::asio;
@@ -244,6 +247,19 @@ namespace stream {
       std::jthread worker_;
     };
   }  // namespace
+
+  // Set to true on first 0x3003 mic packet receipt for timeout diagnostics.
+  static std::atomic<bool> mic_first_packet_received {false};
+
+  // Stats from the most recently ended session, for the web UI mic status card.
+  static std::atomic<bool> g_mic_has_last_session {false};
+  static std::atomic<std::uint64_t> g_mic_last_packets_received {0};
+  static std::atomic<std::uint64_t> g_mic_last_frames_written {0};
+
+  // Count of live sessions currently holding the default-capture switch.
+  // mic_first_packet_received alone is unsafe as a "capture in use" signal:
+  // a second session's start resets it while the first still holds the switch.
+  static std::atomic<int> g_mic_capture_switched_sessions {0};
 
   enum class socket_e : int {
     video,  ///< Video
@@ -589,6 +605,15 @@ namespace stream {
     control_server_t control_server;
   };
 
+  // Comparator for the mic jitter buffer: circular (modulo-65536) comparison
+  // so that the wraparound from seq 65535 → 0 doesn't cause begin() to return
+  // the newest packet. (int16_t)(a - b) < 0 is the RFC 1982 serial comparator.
+  struct mic_seq_order_t {
+    bool operator()(std::uint16_t a, std::uint16_t b) const {
+      return static_cast<std::int16_t>(a - b) < 0;
+    }
+  };
+
   struct session_t {
     std::shared_ptr<void> display_power_guard;
     std::shared_ptr<void> normal_display_capture;
@@ -702,6 +727,52 @@ namespace stream {
       std::atomic<std::int64_t> last_frame_index {0};
       std::chrono::steady_clock::time_point start_time {std::chrono::steady_clock::now()};
     } stats;
+    // Mic passthrough: Opus decode → virtual audio render endpoint
+    static constexpr std::size_t mic_max_queued_packets = 32;
+
+    struct mic_queued_packet_t {
+      std::vector<std::uint8_t> payload;
+      std::uint16_t seq;
+    };
+
+    struct {
+      std::unique_ptr<OpusDecoder, void (*)(OpusDecoder *)> decoder {nullptr, opus_decoder_destroy};
+      int channels = 0;
+
+      // Armed at session start when mic passthrough is configured + encrypted.
+      // Full init (vmic backend, capture switch, reapply thread) is deferred to
+      // the first mic packet so clients that never send mic data (e.g. Aurora /
+      // moonlight-tv) never touch host audio state. One-shot: cleared on first
+      // attempt regardless of outcome.
+      bool lazy_init_pending = false;
+
+      // Snapshot of default capture roles saved before switching; restored on session end.
+      platf::capture_snapshot_t capture_snap;
+      bool capture_switched = false;
+
+      // Kept alive across the session to avoid re-running audio_control() on teardown.
+      // Shared pointer so the capture-reapply detached thread can hold a reference
+      // past session teardown without use-after-free.
+      std::shared_ptr<platf::audio_control_t> audio_ctrl;
+
+      // Cancel flag for the capture-reapply retry thread. Set to true on teardown
+      // so the thread exits early rather than retrying after session objects are gone.
+      std::shared_ptr<std::atomic<bool>> reapply_cancel;
+
+      std::map<std::uint16_t, mic_queued_packet_t, mic_seq_order_t> pending_packets;
+      std::uint16_t expected_seq = 0;
+      bool has_playout_cursor = false;
+
+      // Stats
+      std::uint64_t packets_received = 0;
+      std::uint64_t decode_errors = 0;
+      std::uint64_t plc_events = 0;
+      std::uint64_t silence_frames = 0;
+      std::uint64_t frames_written = 0;
+      std::uint64_t encryption_failures = 0;
+
+      std::chrono::steady_clock::time_point last_recv_time;
+    } mic;
 
 #if defined(_WIN32) || defined(__linux__)
     struct {
@@ -710,6 +781,82 @@ namespace stream {
     } virtual_display;
 #endif
   };
+
+  /**
+   * @brief Full mic-passthrough init: vmic backend, Opus decoder, default-capture
+   * switch and the capture-reapply thread. Deferred to the first mic packet
+   * (see session_t::mic.lazy_init_pending) so non-mic clients never touch host
+   * audio state. Runs on the control thread; serialized against teardown by the
+   * controlEnd ordering in session::join().
+   */
+  static bool init_mic_passthrough(session_t &session) {
+    auto audio_ctrl = platf::audio_control();
+    if (!audio_ctrl) return false;
+
+    const auto snap = audio_ctrl->snapshot_capture_defaults();
+
+    // Write pre-session default capture name to state file.
+    // Used by startup restore guard to recover if Vibepollo is hard-killed.
+    if (!config::audio.mic_capture_device.empty() && !snap.console_id.empty()) {
+      const auto state_file = platf::appdata() / "mic_capture_prev.txt";
+      const auto pre_session_name = audio_ctrl->get_current_default_capture_name();
+      if (!pre_session_name.empty() && pre_session_name != config::audio.mic_capture_device) {
+        std::ofstream f(state_file, std::ios::trunc);
+        f << pre_session_name;
+        f.close();
+        BOOST_LOG(debug) << "[mic] state file written: pre-session default = " << pre_session_name;
+      }
+    }
+
+    // Initialize Steam Streaming Microphone backend
+    if (audio_ctrl->init_mic_redirect_device() != 0) {
+      BOOST_LOG(warning) << "[mic] Steam Streaming Microphone unavailable — passthrough disabled"sv;
+      return false;
+    }
+    BOOST_LOG(info) << "[mic] using Steam Streaming Microphone backend"sv;
+
+    int err = OPUS_OK;
+    auto *dec = opus_decoder_create(48000, 1, &err);
+    if (err != OPUS_OK || !dec) {
+      BOOST_LOG(error) << "[mic] decoder create failed: "sv << opus_strerror(err);
+      return false;
+    }
+
+    session.mic.decoder.reset(dec);
+    session.mic.channels = 1;
+    // Store as shared_ptr so the capture-reapply thread can co-own it safely.
+    session.mic.audio_ctrl = std::shared_ptr<platf::audio_control_t>(std::move(audio_ctrl));
+
+    if (!config::audio.mic_capture_device.empty()) {
+      session.mic.audio_ctrl->switch_capture_to(config::audio.mic_capture_device);
+      session.mic.capture_snap = snap;
+      session.mic.capture_switched = true;
+      g_mic_capture_switched_sessions.fetch_add(1, std::memory_order_relaxed);
+
+      // Capture retry thread: re-applies the default capture device switch at
+      // increasing intervals because SteamOS/PipeWire may reset it asynchronously.
+      // Captures audio_ctrl by shared_ptr value and cancel by shared_ptr value —
+      // no reference to session, so session teardown cannot cause use-after-free.
+      auto cancel = std::make_shared<std::atomic<bool>>(false);
+      session.mic.reapply_cancel = cancel;
+      auto ctrl = session.mic.audio_ctrl;  // shared ownership
+      auto device = config::audio.mic_capture_device;
+      std::thread([cancel, ctrl, device]() {
+        const int schedule[] = {2, 5, 10, 20};
+        int prev = 0;
+        for (int t : schedule) {
+          std::this_thread::sleep_for(std::chrono::seconds(t - prev));
+          prev = t;
+          if (cancel->load(std::memory_order_acquire) || device.empty()) break;
+          ctrl->switch_capture_to(device);
+          BOOST_LOG(info) << "[mic] capture re-apply at +"sv << t << "s"sv;
+        }
+      }).detach();
+    }
+
+    BOOST_LOG(info) << "[mic] passthrough active → "sv << config::audio.mic_sink;
+    return true;
+  }
 
   /**
    * First part of cipher must be struct of type control_encrypted_t
@@ -772,6 +919,42 @@ namespace stream {
   void end_broadcast(broadcast_ctx_t &ctx);
 
   static auto broadcast = safe::make_shared<broadcast_ctx_t>(start_broadcast, end_broadcast);
+
+  std::optional<control_packet_view_t> decode_control_packet(std::string_view packet_bytes) {
+    if (packet_bytes.size() < sizeof(std::uint16_t)) {
+      return std::nullopt;
+    }
+
+    const auto type = util::packet::read_u16_le(packet_bytes, 0);
+    const auto payload = util::packet::slice(
+      packet_bytes,
+      sizeof(std::uint16_t),
+      packet_bytes.size() - sizeof(std::uint16_t)
+    );
+    if (!type || !payload) {
+      return std::nullopt;
+    }
+
+    return control_packet_view_t {*type, *payload};
+  }
+
+#ifdef SUNSHINE_TESTS
+  std::optional<control_packet_view_t> decode_control_packet_for_tests(std::string_view packet_bytes) {
+    return decode_control_packet(packet_bytes);
+  }
+#endif
+  mic_status_t get_mic_status() {
+    const bool session_active = session::running_sessions.load(std::memory_order_relaxed) > 0;
+    return mic_status_t {
+      .session_active = session_active,
+      .mic_active = session_active && mic_first_packet_received.load(std::memory_order_relaxed),
+      .capture_switched = g_mic_capture_switched_sessions.load(std::memory_order_relaxed) > 0,
+      .has_last_session = g_mic_has_last_session.load(std::memory_order_relaxed),
+      .last_packets_received = g_mic_last_packets_received.load(std::memory_order_relaxed),
+      .last_frames_written = g_mic_last_frames_written.load(std::memory_order_relaxed),
+    };
+  }
+
 
   void request_idr_for_all_sessions() {
     auto ref = broadcast.ref();
@@ -1611,6 +1794,180 @@ namespace stream {
       }
     });
 
+    server->map(packetTypes[IDX_MIC_AUDIO_DATA], [](session_t *session, const std::string_view &payload) {
+      BOOST_LOG(verbose) << "type [IDX_MIC_AUDIO_DATA]"sv;
+
+      if (!session->mic.audio_ctrl || !session->mic.decoder) {
+        // Lazy init on first mic packet (one-shot — failure disables for this session)
+        if (!session->mic.lazy_init_pending) return;
+        session->mic.lazy_init_pending = false;
+        bool init_ok = false;
+        try {
+          init_ok = init_mic_passthrough(*session);
+        } catch (...) {
+          BOOST_LOG(error) << "[mic] init threw exception — mic disabled"sv;
+        }
+        if (!init_ok) {
+          session->mic.decoder.reset();
+          session->mic.audio_ctrl.reset();
+          return;
+        }
+      }
+
+      // Require encrypted control stream
+      if (!(session->config.encryptionFlagsEnabled & SS_ENC_CONTROL_V2)) {
+        if (session->mic.encryption_failures++ == 0) {
+          BOOST_LOG(warning) << "[mic] Plaintext control stream — mic passthrough disabled."sv;
+          session->mic.audio_ctrl.reset();
+          session->mic.decoder.reset();
+        }
+        return;
+      }
+
+      // Need at least the 4-byte framing header
+      if (payload.size() < 4 || payload.size() >= 4096) {
+        BOOST_LOG(warning) << "[mic] malformed packet (len="sv << payload.size() << ")"sv;
+        return;
+      }
+
+      // Fix 1: parse real sender sequence number from 4-byte wire header [seq_hi, seq_lo, ch, flags]
+      const auto *hdr = reinterpret_cast<const std::uint8_t *>(payload.data());
+      const std::uint16_t incoming_seq = (static_cast<std::uint16_t>(hdr[0]) << 8) | hdr[1];
+
+      // Fix A: validate ch and flags fields
+      if (hdr[2] != 1 || hdr[3] != 0) {
+        BOOST_LOG(warning) << "[mic] invalid header (ch="sv << (int)hdr[2]
+                           << " flags="sv << (int)hdr[3] << ") — dropping"sv;
+        return;
+      }
+
+      const std::string_view opus_payload { payload.data() + 4, payload.size() - 4 };
+
+      // Fix A: validate Opus packet structure before inserting into jitter buffer
+      {
+        unsigned char toc_byte = 0;
+        const unsigned char *frames_arr[48] = {};
+        opus_int16 sizes[48] = {};
+        int payload_offset = 0;
+        int nb_frames = opus_packet_parse(
+          reinterpret_cast<const unsigned char *>(opus_payload.data()),
+          static_cast<opus_int32>(opus_payload.size()),
+          &toc_byte, frames_arr, sizes, &payload_offset);
+        if (nb_frames < 0) {
+          session->mic.decode_errors++;
+          BOOST_LOG(warning) << "[mic] opus_packet_parse failed ("sv << nb_frames << ") — dropping"sv;
+          return;
+        }
+      }
+
+      // Fix A: derive frame size from packet instead of hardcoding
+      const int expected_samples = opus_packet_get_nb_samples(
+        reinterpret_cast<const unsigned char *>(opus_payload.data()),
+        static_cast<opus_int32>(opus_payload.size()),
+        48000);
+      const int frame_size = (expected_samples > 0 && expected_samples <= 5760)
+                             ? expected_samples : 960;
+
+      if (!stream::mic_first_packet_received.exchange(true, std::memory_order_relaxed))
+        BOOST_LOG(info) << "[mic] First mic packet received from client"sv;
+
+      auto recv_time = std::chrono::steady_clock::now();
+      auto &mic = session->mic;
+      mic.packets_received++;
+
+      // Steam mic path handles underruns natively via jitter buffer
+      mic.last_recv_time = recv_time;
+
+      // Guard: reject packets too far outside the playout window.
+      // mic_seq_order_t uses RFC 1982 serial arithmetic (int16_t)(a-b) < 0, which is
+      // NOT a valid std::map comparator for keys exactly 32768 apart (antisymmetry
+      // fails, corrupting the tree). Clamping insertions to ±2*mic_max_queued_packets
+      // around expected_seq keeps all keys within a region where the comparator is
+      // consistent. Packets outside this window are from a reconnect or misbehaving
+      // client and can be safely dropped.
+      // Guard applies both after cursor is established and during prebuffering once
+      // we have a reference key — preventing the comparator edge from being reached
+      // with keys exactly 32768 apart at any stage of the pipeline.
+      if (mic.has_playout_cursor || !mic.pending_packets.empty()) {
+        std::uint16_t ref_seq = mic.has_playout_cursor ? mic.expected_seq : mic.pending_packets.begin()->first;
+        auto delta = static_cast<std::int16_t>(incoming_seq - ref_seq);
+        if (delta < 0 || delta > static_cast<std::int16_t>(session_t::mic_max_queued_packets * 2)) {
+          BOOST_LOG(debug) << "[mic] dropping out-of-window packet seq="sv << incoming_seq
+                           << " ref="sv << ref_seq << " delta="sv << (int)delta;
+          return;
+        }
+      }
+
+      // Insert into jitter buffer
+      mic.pending_packets.emplace(incoming_seq, session_t::mic_queued_packet_t {
+        std::vector<std::uint8_t> {
+          reinterpret_cast<const std::uint8_t *>(opus_payload.data()),
+          reinterpret_cast<const std::uint8_t *>(opus_payload.data()) + opus_payload.size()
+        },
+        incoming_seq
+      });
+      if (mic.pending_packets.size() > session_t::mic_max_queued_packets)
+        mic.pending_packets.erase(mic.pending_packets.begin());
+
+      // Prebuffer
+      if (!mic.has_playout_cursor) {
+        if (mic.pending_packets.size() < (std::size_t) config::audio.mic_buffer_packets) return;
+        mic.expected_seq = mic.pending_packets.begin()->first;
+        mic.has_playout_cursor = true;
+        BOOST_LOG(info) << "[mic] Jitter buffer ready ("sv << config::audio.mic_buffer_packets << " packets)"sv;
+      }
+
+      // Drain in sequence order
+      while (!mic.pending_packets.empty()) {
+        auto it = mic.pending_packets.find(mic.expected_seq);
+        std::vector<float> pcm((size_t)(frame_size * mic.channels));
+        int frames = 0;
+
+        if (it != mic.pending_packets.end()) {
+          frames = opus_decode_float(mic.decoder.get(), it->second.payload.data(),
+            (opus_int32) it->second.payload.size(), pcm.data(), frame_size, 0);
+          mic.pending_packets.erase(it);
+        } else {
+          auto next_it = mic.pending_packets.find(static_cast<std::uint16_t>(mic.expected_seq + 1));
+          if (next_it != mic.pending_packets.end()) {
+            frames = opus_decode_float(mic.decoder.get(), next_it->second.payload.data(),
+              (opus_int32) next_it->second.payload.size(), pcm.data(), frame_size, 1);
+          } else if (!mic.pending_packets.empty() && mic_seq_order_t()(mic.expected_seq, mic.pending_packets.begin()->first)) {
+            frames = opus_decode_float(mic.decoder.get(), nullptr, 0, pcm.data(), frame_size, 0);
+            mic.plc_events++;
+          } else {
+            break;
+          }
+        }
+
+        mic.expected_seq = static_cast<std::uint16_t>(mic.expected_seq + 1);
+
+        if (frames < 0) {
+          mic.decode_errors++;
+          BOOST_LOG(warning) << "[mic] Opus decode error: "sv << opus_strerror(frames);
+          continue;
+        }
+        if (frames == 0) continue;
+
+        int write_ret = mic.audio_ctrl->write_mic_pcm(pcm.data(), (std::uint32_t) frames);
+        if (write_ret < 0) {
+          BOOST_LOG(error) << "[mic] Steam mic render path lost — disabling mic for this session"sv;
+          mic.audio_ctrl->release_mic_redirect_device();
+          return;
+        }
+        mic.frames_written++;
+        if (mic.packets_received % 100 == 0) {
+          std::size_t qsz = mic.pending_packets.size();
+          BOOST_LOG(info) << "[mic] stats: recv="sv << mic.packets_received
+                          << " decoded="sv << mic.frames_written
+                          << " plc="sv << mic.plc_events
+                          << " silence="sv << mic.silence_frames
+                          << " errors="sv << mic.decode_errors
+                          << " queue="sv << qsz;
+        }
+      }
+    });
+
     server->map(packetTypes[IDX_ENCRYPTED], [server](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_ENCRYPTED]"sv;
 
@@ -1763,6 +2120,7 @@ namespace stream {
           process_terminated_since = now;
         }
 
+
         KITTY_WHILE_LOOP(auto pos = std::begin(*server->_sessions), pos != std::end(*server->_sessions), {
           // Don't perform additional session processing if we're shutting down
           if (shutdown_event->peek() || broadcast_shutdown_event->peek()) {
@@ -1881,6 +2239,7 @@ namespace stream {
             has_processless_live_session,
             has_game_session_pending_or_draining
           )) {
+
         BOOST_LOG(info) << "Process terminated"sv;
         break;
       }
@@ -3560,7 +3919,10 @@ namespace stream {
         auto hung_stage = std::make_shared<std::atomic<const char *>>("video thread");
         join_deadline_t join_deadline {hung_stage};
 
-        BOOST_LOG(debug) << "Waiting for video to end..."sv;
+        // Teardown progress logged at info so that if join() hangs (the 10s watchdog
+        // above fires), the last "Teardown:" line before the Fatal pinpoints the
+        // blocking step. Cheap; sessions end infrequently.
+        BOOST_LOG(info) << "Teardown: joining video thread..."sv;
         session.videoThread.join();
         hung_stage->store("audio thread");
         BOOST_LOG(debug) << "Waiting for audio to end..."sv;
@@ -3588,6 +3950,39 @@ namespace stream {
         lifecycle_lock.lock();
       }
       // Snapshot the app environment before pause or finalization can change it.
+
+
+      // Cancel the capture-reapply retry thread so it doesn't access audio_ctrl
+      // after we reset it below. The detached thread holds shared ownership of
+      // audio_ctrl, so the object stays alive until the thread exits naturally.
+      if (session.mic.reapply_cancel) {
+        session.mic.reapply_cancel->store(true, std::memory_order_release);
+        session.mic.reapply_cancel.reset();
+      }
+
+      // Restore default capture device if we switched it on session start
+      if (session.mic.capture_switched && session.mic.audio_ctrl) {
+        session.mic.audio_ctrl->restore_capture_from(session.mic.capture_snap);
+        session.mic.capture_switched = false;
+        g_mic_capture_switched_sessions.fetch_sub(1, std::memory_order_relaxed);
+      }
+      if (session.mic.audio_ctrl) {
+        session.mic.audio_ctrl->release_mic_redirect_device();
+      }
+      session.mic.decoder.reset();
+      session.mic.audio_ctrl.reset();
+      BOOST_LOG(info) << "[mic] session end: recv="sv << session.mic.packets_received
+                      << " decoded="sv << session.mic.frames_written
+                      << " plc="sv << session.mic.plc_events
+                      << " silence="sv << session.mic.silence_frames
+                      << " errors="sv << session.mic.decode_errors;
+      // Keep last-session stats for the web UI mic status card (only sessions
+      // that actually received mic data — Aurora-style sessions don't count).
+      if (session.mic.packets_received > 0) {
+        g_mic_last_packets_received.store(session.mic.packets_received, std::memory_order_relaxed);
+        g_mic_last_frames_written.store(session.mic.frames_written, std::memory_order_relaxed);
+        g_mic_has_last_session.store(true, std::memory_order_relaxed);
+      }
 
       if (!session.undo_cmds.empty()) {
         auto exec_thread = std::thread([cmd_list = session.undo_cmds, env = proc::proc.get_env()]() mutable {
@@ -3667,10 +4062,13 @@ namespace stream {
           proc::proc.pause(true);
         }
         const bool is_paused = proc::proc.current_app_id() > 0;
+
         if (is_paused) {
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
-          system_tray::update_tray_pausing(proc::proc.get_last_run_app_name());
-#endif
+          const auto poll_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+          while (proc::proc.running() && std::chrono::steady_clock::now() < poll_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          }
+          is_paused = proc::proc.running();
         }
 
 #ifdef _WIN32
@@ -3761,9 +4159,27 @@ namespace stream {
 
       session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
 
+      // Initialize mic passthrough
+      stream::mic_first_packet_received.store(false, std::memory_order_relaxed);
+      const bool mic_encrypted = (session.config.encryptionFlagsEnabled & SS_ENC_CONTROL_V2) != 0;
+
+      if (config::audio.mic_sink.empty()) {
+        BOOST_LOG(info) << "[mic] mic_sink not configured — passthrough disabled"sv;
+      } else if (!mic_encrypted) {
+        BOOST_LOG(warning) << "[mic] no encrypted control stream — passthrough disabled"sv;
+      } else {
+        // Defer full init (vmic backend, capture switch, reapply thread) to the
+        // first mic packet — see init_mic_passthrough(). Non-mic clients (e.g.
+        // Aurora / moonlight-tv) never send one, so host capture state stays
+        // untouched for their sessions.
+        session.mic.lazy_init_pending = true;
+        BOOST_LOG(info) << "[mic] passthrough armed — init deferred to first mic packet"sv;
+      }
+
       if (!session.audio_disabled) {
         session.audioThread = std::thread {audioThread, &session};
       }
+
       session.videoThread = std::thread {videoThread, &session};
 
       session.state.store(state_e::RUNNING, std::memory_order_relaxed);
