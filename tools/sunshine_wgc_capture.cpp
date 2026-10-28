@@ -1076,6 +1076,9 @@ private:
     winrt::com_ptr<ID3D11Texture2D> texture;
     size_t scratch_index = 0;
     uint64_t frame_qpc = 0;
+    int64_t source_time_100ns = 0;
+    std::chrono::steady_clock::time_point ready_at {};
+    bool deferred = false;
   };
 
   static constexpr auto WGC_DIAGNOSTICS_LOG_INTERVAL = std::chrono::seconds(15);
@@ -1125,6 +1128,7 @@ private:
   uint64_t _last_diagnostics_slow_copy = 0;
   uint64_t _last_diagnostics_activity_rate_limited = 0;
   uint32_t _activity_admission_generation = 0;
+  int32_t _activity_admission_fps = 0;
   platf::dxgi::wgc_policy::source_admission_t _activity_admission;
   std::mutex _delivery_mutex;
   std::condition_variable _delivery_cv;
@@ -1407,9 +1411,7 @@ public:
           qpc_frequency
         );
         record_frame_arrival(drained_frames);
-        if (admit_activity_frame(source_time_100ns)) {
-          queue_frame_for_delivery(std::move(frame), surface, frame_qpc);
-        }
+        queue_frame_for_delivery(std::move(frame), surface, frame_qpc, source_time_100ns);
       } catch (const winrt::hresult_error &ex) {
         // Log error
         BOOST_LOG(error) << "WinRT error in frame processing: " << ex.code() << " - " << winrt::to_string(ex.message());
@@ -1565,6 +1567,7 @@ private:
       _activity_admission_generation = generation;
       _activity_admission = {};
     }
+    _activity_admission_fps = admission_fps;
 
     if (!_activity_admission.admit(
           admission_fps,
@@ -1688,9 +1691,8 @@ private:
     return true;
   }
 
+  // Caller holds _delivery_mutex for scratch ownership and admission ordering.
   std::optional<size_t> reserve_scratch_texture() {
-    std::lock_guard lock(_delivery_mutex);
-
     if (_delivery_stop || _shutting_down.load(std::memory_order_acquire)) {
       return std::nullopt;
     }
@@ -1729,15 +1731,12 @@ private:
   }
 
   void release_reserved_scratch_texture(size_t index) {
-    std::lock_guard lock(_delivery_mutex);
     if (index < _scratch_textures.size() && _scratch_textures[index].state == scratch_state_e::reserved) {
       _scratch_textures[index].state = scratch_state_e::free;
     }
   }
 
-  bool enqueue_scratch_texture(size_t index, uint64_t frame_qpc) {
-    std::lock_guard lock(_delivery_mutex);
-
+  bool enqueue_scratch_texture(size_t index, uint64_t frame_qpc, int64_t source_time_100ns, std::chrono::steady_clock::time_point ready_at, bool deferred) {
     if (index >= _scratch_textures.size() || !_scratch_textures[index].texture) {
       return false;
     }
@@ -1765,7 +1764,10 @@ private:
     _pending_delivery_frame = delivery_frame_t {
       .texture = _scratch_textures[index].texture,
       .scratch_index = index,
-      .frame_qpc = frame_qpc
+      .frame_qpc = frame_qpc,
+      .source_time_100ns = source_time_100ns,
+      .ready_at = ready_at,
+      .deferred = deferred
     };
     return true;
   }
@@ -1781,7 +1783,6 @@ private:
    * @return true if the frame was published.
    */
   bool try_publish_directly(const winrt::com_ptr<ID3D11Texture2D> &frame_tex, uint64_t frame_qpc) {
-    std::unique_lock delivery_lock(_delivery_mutex);
     const bool frame_delivering = std::any_of(_scratch_textures.begin(), _scratch_textures.end(), [](const auto &scratch) {
       return scratch.state == scratch_state_e::delivering;
     });
@@ -1811,7 +1812,6 @@ private:
     _deps->resource_manager.publish_frame_metadata(frame_qpc);
     const HRESULT release_hr = keyed_mutex->ReleaseSync(0);
     context_lock.unlock();
-    delivery_lock.unlock();
     if (FAILED(release_hr)) {
       BOOST_LOG(warning) << "Failed to release mutex key 0: " << std::format(": 0x{:08X}", release_hr);
       return true;
@@ -1828,8 +1828,9 @@ private:
    * @param frame The WGC frame object; it is released before the shared IPC mutex can block.
    * @param surface The captured D3D11 surface.
    * @param frame_qpc The QPC timestamp from when the frame was captured.
+   * @param source_time_100ns The original compositor timestamp used by admission.
    */
-  void queue_frame_for_delivery(Direct3D11CaptureFrame frame, winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DSurface surface, uint64_t frame_qpc) {
+  void queue_frame_for_delivery(Direct3D11CaptureFrame frame, winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DSurface surface, uint64_t frame_qpc, int64_t source_time_100ns) {
     if (!_deps) {
       return;
     }
@@ -1848,7 +1849,13 @@ private:
       return;
     }
 
-    if (try_publish_directly(frame_tex, frame_qpc)) {
+    // Serialize admission, pending-frame replacement and deferred admission.
+    // All scratch/publication helpers below are called with this lock held.
+    std::unique_lock delivery_lock(_delivery_mutex);
+    const bool admitted = admit_activity_frame(source_time_100ns);
+    const auto now = std::chrono::steady_clock::now();
+    const auto ready_at = admitted ? now : std::chrono::steady_clock::time_point(std::chrono::duration_cast<std::chrono::steady_clock::duration>(_activity_admission.deferred_callback_time(_activity_admission_fps, std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()))));
+    if (admitted && try_publish_directly(frame_tex, frame_qpc)) {
       return;
     }
 
@@ -1872,9 +1879,10 @@ private:
     // the main process' shared keyed mutex without starving WGC FrameArrived.
     frame = nullptr;
 
-    if (!enqueue_scratch_texture(*scratch_index, frame_qpc)) {
+    if (!enqueue_scratch_texture(*scratch_index, frame_qpc, source_time_100ns, ready_at, !admitted)) {
       return;
     }
+    delivery_lock.unlock();
     _delivery_cv.notify_one();
   }
 
@@ -1898,9 +1906,21 @@ private:
       std::optional<delivery_frame_t> frame;
       {
         std::unique_lock lock(_delivery_mutex);
-        _delivery_cv.wait(lock, [&]() {
-          return _delivery_stop || stop_token.stop_requested() || _pending_delivery_frame.has_value();
-        });
+        for (;;) {
+          if (_delivery_stop || stop_token.stop_requested()) {
+            break;
+          }
+          if (!_pending_delivery_frame) {
+            _delivery_cv.wait(lock);
+          } else if (std::chrono::steady_clock::now() < _pending_delivery_frame->ready_at) {
+            // Re-check after every wake: a newer frame can replace this one or
+            // become immediately eligible. Idle capture needs no further event.
+            const auto deadline = _pending_delivery_frame->ready_at;
+            _delivery_cv.wait_until(lock, deadline);
+          } else {
+            break;
+          }
+        }
 
         if (_delivery_stop || stop_token.stop_requested()) {
           break;
@@ -1908,6 +1928,9 @@ private:
 
         frame = std::move(_pending_delivery_frame);
         _pending_delivery_frame.reset();
+        if (frame && frame->deferred) {
+          _activity_admission.admit_deferred(frame->source_time_100ns, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()));
+        }
         if (frame && frame->scratch_index < _scratch_textures.size()) {
           _scratch_textures[frame->scratch_index].state = scratch_state_e::delivering;
         }

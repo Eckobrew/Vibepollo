@@ -115,7 +115,8 @@ struct Manager {
   void record_frame_pool_pressure(std::chrono::steady_clock::time_point) {}
   void record_frame_arrival(uint32_t count) { ++captured; drained += count; }
   void check_and_adjust_frame_buffer() { ++checks; }
-  void queue_frame_for_delivery(Direct3D11CaptureFrame, int pixels, uint64_t qpc) {
+  void queue_frame_for_delivery(Direct3D11CaptureFrame, int pixels, uint64_t qpc, int64_t source_time_100ns = 0) {
+    if (ADMISSION_IN_QUEUE && !admit_activity_frame(source_time_100ns)) return;
     Delivery next {pixels, qpc, ReplayClock::time.count()};
     admitted.push_back(next);
     replaced += pending.has_value();
@@ -297,6 +298,7 @@ int main() {
         "// ADMISSION_METHOD": block(source, "  bool admit_activity_frame("),
         "// IPC_UPDATE": block(ipc, "  if (message.size() == sizeof(platf::dxgi::activity_admission_data_t))"),
         "CADENCE_ONLY": "true" if args.case == "cadence" else "false",
+        "ADMISSION_IN_QUEUE": "true" if "const bool admitted = admit_activity_frame(" in source else "false",
     }
     for marker, replacement in replacements.items():
         code = code.replace(marker, replacement)

@@ -296,6 +296,13 @@ namespace platf::dxgi::wgc_policy {
       const auto source_gap = 10'000'000LL / fps;
       const auto callback_gap = 1'000'000'000LL / fps;
       if (_has_admitted) {
+        // Deferred content may have an older compositor timestamp than its
+        // publication. Do not let that old source anchor admit another frame
+        // immediately after the timed delivery and exceed the ceiling.
+        if (_last_admission_was_deferred &&
+            (callback_time - _last_admitted_callback).count() < (callback_gap > 0 ? callback_gap : 1)) {
+          return false;
+        }
         if (advancing && _source_anchored) {
           // Floor in the timestamp's native 100 ns units, so a quantized exact
           // 60 FPS source (166666/166667 ticks) still meets a 60 FPS ceiling.
@@ -308,6 +315,7 @@ namespace platf::dxgi::wgc_policy {
       }
 
       _has_admitted = true;
+      _last_admission_was_deferred = false;
       _last_admitted_callback = callback_time;
       _source_anchored = advancing;
       if (advancing) {
@@ -316,8 +324,32 @@ namespace platf::dxgi::wgc_policy {
       return true;
     }
 
+    // A rejected update still contains newer desktop/cursor content. Schedule
+    // its trailing delivery independently of another FrameArrived callback.
+    std::chrono::nanoseconds deferred_callback_time(const int fps, const std::chrono::nanoseconds now) const noexcept {
+      if (!_has_admitted || fps <= 0) {
+        return now;
+      }
+      const auto gap = std::chrono::nanoseconds(1'000'000'000LL / fps);
+      const auto deadline = _last_admitted_callback + (gap.count() > 0 ? gap : std::chrono::nanoseconds(1));
+      return deadline > now ? deadline : now;
+    }
+
+    // Called under the same delivery lock as admit(), when the pending update
+    // becomes eligible. Re-anchor the ceiling so the next callback cannot spend
+    // the interval already used by this deferred publication.
+    void admit_deferred(const std::int64_t source_100ns, const std::chrono::nanoseconds callback_time) noexcept {
+      _has_admitted = true;
+      _last_admission_was_deferred = true;
+      _source_anchored = source_100ns > 0;
+      _last_observed_source = source_100ns;
+      _last_admitted_source = source_100ns;
+      _last_admitted_callback = callback_time;
+    }
+
   private:
     bool _has_admitted = false;
+    bool _last_admission_was_deferred = false;
     bool _source_anchored = false;
     std::int64_t _last_observed_source = 0;
     std::int64_t _last_admitted_source = 0;
